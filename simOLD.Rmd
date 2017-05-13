@@ -1,0 +1,276 @@
+---
+title: "simOLD"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r, include=FALSE, echo=FALSE, warning=FALSE}
+library(data.table) #I never leave home without this library.
+library(ggplot2) #also a basic need for graphics
+bcresults = fread("BCresults.csv")
+districts = bcresults[votes==1,]
+bc = bcresults[votes!=1,]
+names(districts) = c("riding","bbox","votes","total","empty")
+
+ptots = bc[,sum(votes),by=party]
+setkey(ptots,party)
+setkey(bc,party)
+bc = bc[ptots]
+
+setkey(bc,riding) #sets sort order for prefs
+bc[,ppart:=votes/V1]
+bc[party=="Independent",ppart:=0]
+x=dim(bc)
+greenies = bc[party=="BC Green Party" & percent>.25,]
+bc[,delegated:=votes*.3]
+bc[V1<400000,delegated:=votes*.5]
+bc[,ol:=votes-delegated]
+seats = dim(districts)[1]
+quota = sum(bc[,votes])/(seats+1)
+spectrum = c(
+  "BC Cascadia Party","Independent","Land Air Water-The L.A.W.","Your Political Party of BC (YPP)","Communist Party of BC", "4BC","The Vancouver Island Party", 
+
+  
+  "BC Green Party","BC NDP","BC Liberal Party",
+  
+  "BC Conservative Party","BC First","Libertarian","BC Citizens First Party", "Christian Heritage Party of B.C.", "Republican Party", "BC Action Party", "",   "BC Refed","BC Social Credit Party"
+)
+
+serious = c(
+  "BC Green Party","BC NDP","BC Liberal Party")
+
+nearto = function(v,e) {
+  dt = data.table(v=v, i=abs((1:length(v))-match(e,v)))
+  setkey(dt,i)
+  return(c(dt[v!=e,v]))
+}
+fakeprefsof = function(name, el=bc, spect=spectrum) {
+  cparty = el[cname==name,party]
+  pcands = el[party==cparty,cname]
+  pvec = nearto(pcands,name)
+  print(as.character(cparty))
+  for (pparty in nearto(spect, as.character(cparty))) {
+    if (pparty %in% serious) {
+      pvec = c(pvec, nearto(el[party==pparty | name==cname,cname], name))
+    }
+    if (length(pvec) > 100) break
+  }
+  prefs = data.table(ofwhom=name,forwhom=pvec,n=1:length(pvec))
+  return(prefs)
+}
+fakeprefs = fakeprefsof(bc[1,cname])
+for (name in bc[-1,cname]) {
+  fakeprefs = rbind(fakeprefs,fakeprefsof(name))
+}
+setkeyv(fakeprefs,c("ofwhom","n"))
+
+
+
+startElection = function(bc=bc,ptot=ptots) {
+  bc[,valid:=T]
+  bc[,winner:=F]
+  bc[,dval:=votes]
+  bc[,holder := cname]
+  setkey(bc,cname) #faster lookups
+  
+  ptot[,ols:=0]
+  ptot[,fakeols:=0]
+}
+
+is1true = function(a) {
+  return(length(a)==1 && !is.na(a) && a==T)
+}
+
+oneNextHolder = function(orig,cur,el) {
+  
+  relevant = fakeprefs[orig,]
+  if (orig==cur) {
+    num=0
+  } else {
+    num = relevant[forwhom==cur,n]
+  }
+  rows = relevant[n>num,]
+  for (i in 1:dim(rows)[1]) {
+    if (is1true(el[cname==rows[i,forwhom],valid])) {
+      return(rows[i,forwhom])
+    }
+  }
+  cat("exhausted",orig,bc[cname==orig,party],"\n")
+  return("") #exhausted
+}
+
+nextHolder = function(orig, cur, el) {
+  return(mapply(oneNextHolder,force(orig),cur,el))
+}
+
+moveDel = function(name,el=bc) {
+  
+  rows = el[holder==name,which=T]
+  for (row in rows) {
+    el[row,holder:=oneNextHolder(el[row,cname],name,el)]
+  }
+}
+
+moveOl = function(name,cparty,el=bc,ptot=ptots,passon=1) {
+  frac = sum(bc[party==cparty & valid==T,ppart])
+  
+  if (frac==0) { frac = .0001 } # prevent divide-by-zero. Doesn't matter in this case.
+  extra = passon * (ptot[cparty,fakeols] * el[cname==name,ppart]   #second-hand ols
+                    + el[cname==name,ol]) #first-hand ols
+  ptot[cparty,c("fracleft","ols","fakeols") := list(frac,
+                  ols + extra,fakeols+(extra/frac))]
+}
+
+elim = function(name,el=bc,ptot=ptots) {
+  #print("ELIM!")
+  #print(name)
+  cparty = el[cname==name,party]
+  #print(cparty)
+  el[cname==name,c("valid","dval"):=list(F,delegated)]
+  #print(el[cname==name,list(name,valid)])
+  moveOl(name,cparty,el,ptot)
+  moveDel(name,el)
+  el[holder==name,holder:=nextHolder(cname,name,el)] #move the delegated
+}
+
+elect = function(name,votes,el=bc,ptot=ptots, quot=quota) {
+  if (is.na(votes)) {
+    stop("VOTES IS NA")
+  }
+  if (votes<quot) {
+    print("votes<quota")
+    print(votes)
+  }
+  passon = max(0,(votes-quot)/votes)
+  el[cname==name,c("winner","valid","dval"):=list(T,F,delegated)] #is winner, is not in running, only pass along the delegated part.
+  cparty = el[cname==name,party]
+  
+  moveOl(name,cparty,el,ptot,passon)
+  el[holder==name,dval:=dval * passon] #reduce the delegated
+  moveDel(name,el)
+  return(sum(el[,winner]))
+}
+
+getTots = function(el=bc,ptot=ptots,gold=F) {
+  del = el[,list(dels=sum(dval)),by=holder]
+  if (dim(del[is.na(dels),])[1] > 0) {
+    print(del[is.na(dels),holder])
+  }
+  el[valid==T,nInRiding:=.N,by=riding]
+  ol = el[valid==T, list(holder=cname,
+                         ols=ptot[party,fakeols] * ppart,
+                         nInRiding=nInRiding)]
+  if (dim(ol[is.na(ols),])[1] > 0) {
+    print(ol[is.na(ols),holder])
+  }
+  cat("del",dim(del),"ol",dim(ol),";")
+  setkey(del,holder)
+  setkey(ol,holder)
+  both = ol[del]
+  tots = both[,list(cname=holder,tot=ols+dels,nInRiding=nInRiding)]
+  tots = tots[cname!="",]
+  setkey(tots,tot)
+  return(tots)
+}
+
+runElection = function(el=bc,ptot=ptots,
+                       preelim=.25,
+                       quot=quota,seat=seats,
+                       gold=F) {
+  preelim=preelim*quot*(seat+1)/seat
+  startElection(el,ptot)
+  plive = sum(el[,votes])
+  print("Pre-eliminations")
+  i = 0
+  for (cand in el[votes<preelim,cname]) {
+    theriding = el[cname==cand,riding]
+    inriding = el[riding==theriding,]
+    if (inriding[cname==cand,votes]<  (-(sort(inriding[,-votes])[2]))) {
+      i=i+1
+      if ((i %% 10) == 0) {cat(i,cand,"\n")}
+      elim(cand,el,ptot)
+      
+    } else {
+      cat(inriding[cname==cand,votes],-(sort(inriding[,-votes])[2]),"\n")
+    }
+  }
+  print("Pre-eliminations DONE")
+  print("")
+  if (gold) {minr=1} else {minr=0}
+  while (T) {
+    seatsfilled = sum(el[,winner])
+    if (seatsfilled >= seat) {
+      
+      print("Stopping - done")
+      break
+    }
+    if (sum(el[,valid]) < 1) {
+      
+      print("Stopping - error, no valid cands")
+      break
+    }
+    
+    ctots = getTots(el,ptot,gold)
+    live=sum(ctots[,tot])
+    if (live > plive) {cat("LIVE", live, "PLIVE", plive, quot, "\n")} 
+    plive = live
+    quot=live/(seat-seatsfilled+1)
+    cat("winners",dim(bc[winner==T,])[1],"livevotes",live)
+    print(dim(ctots))
+    if (sum(ctots[,tot]) < quot) {
+      print("Stopping - exhausted ballots")
+      break
+    }
+    
+    biggest = which.max(ctots[,tot])
+    if (ctots[biggest,tot] > quot) {
+      cat("electing",ctots[biggest,cname],"\n")
+      plive = plive - quot
+      winner = ctots[biggest,cname]
+      elect(winner,ctots[biggest,tot],el,ptot,quot)
+      if (gold) {
+        for (cand in el[valid==T & riding==el[cname==winner,riding],cname]) {
+          elim(cand,el,ptot)
+        }
+      }
+    } else {
+      smallest = which.min(ctots[nInRiding>minr,tot])
+      if (length(smallest)==0) {
+        print("Stopping - all remaining cands protected")
+      }
+      cat("elim",ctots[smallest,cname],"\n")
+      elim(ctots[smallest,cname],el,ptot)
+    }
+  }
+  print("")
+  print("")
+  print(el[winner==T,list(cname,party,riding)])
+}
+
+runElection(bc,ptots,0)
+nopre = bc[winner==T,]
+runElection(bc,ptots,0.25)
+withpre = bc[winner==T,]
+table(nopre[,party])
+table(withpre[,party])
+
+runElection(bc,ptots,.3)
+withpre03 = bc[winner==T,]
+runElection(bc,ptots,1/3)
+
+withpre3 = bc[winner==T,]
+
+
+table(withpre03[,party])
+table(withpre3[,party])
+
+runElection(bc,ptots,1/3,gold=T) #GOLD
+
+goldy = bc[winner==T,]
+
+
+table(goldy[,party])
+```
